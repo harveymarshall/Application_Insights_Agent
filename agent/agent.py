@@ -9,6 +9,7 @@ import re
 
 import re
 from langchain_core.tools import tool
+import httpx
 
 @tool
 def extract_kql_query(query_response) -> str:
@@ -61,16 +62,46 @@ Your response must be a valid KQL query and nothing else.
 
 agent = init_agent()
 
+# Store conversation state
+user_states = {}
+
 @cl.on_message
 async def chat(message: cl.Message):
+    user_id = message.author  # Or another unique identifier
+    state = user_states.get(user_id, {})
+
+    if "awaiting_confirmation" in state and state["awaiting_confirmation"]:
+        # User is confirming the KQL query
+        if message.content.strip().lower() in ["yes", "y"]:
+            # Send KQL to MCP server
+            kql_query = state["kql_query"]
+            app_id = "YOUR_APP_ID"
+            api_key = "YOUR_API_KEY"
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:8000/query",
+                    json={"kql_query": kql_query, "app_id": app_id, "api_key": api_key}
+                )
+            if response.status_code == 200:
+                result = response.json()
+                await cl.Message(content=f"Results:\n{result}").send()
+            else:
+                await cl.Message(content=f"Error: {response.text}").send()
+            user_states[user_id] = {}  # Reset state
+        else:
+            await cl.Message(content="Okay, please provide a new question or modify your query.").send()
+            user_states[user_id] = {}
+        return
+
+    # Step 1: User asks a question, agent generates KQL
     raw_response = agent.invoke({"role": "user", "content": message.content})
-    # Extract the actual output string from the agent's response
     if isinstance(raw_response, dict) and "output" in raw_response:
-        llm_response = raw_response["output"]
+        kql_query = raw_response["output"]
     else:
-        llm_response = str(raw_response)
-    cleaned_kql = extract_kql_query.invoke(llm_response)
-    await cl.Message(content=f"```kql\n{cleaned_kql}\n```").send()
+        kql_query = str(raw_response)
+    cleaned_kql = extract_kql_query.invoke(kql_query)
+    user_states[user_id] = {"awaiting_confirmation": True, "kql_query": cleaned_kql}
+    await cl.Message(content=f"```kql\n{cleaned_kql}\n```\n\nDoes this query look sensible? (yes/no)").send()
 
 
 
